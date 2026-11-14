@@ -64,6 +64,33 @@ export type CheckInput = {
 
 const WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
+/**
+ * Weekdays (0 = Monday) someone prefers off, from preferred_day_off rules:
+ * their own rules, or else the store-wide ones (no employee). Values can list
+ * several days ("Tuesday, Wednesday") and use short names ("Tue").
+ */
+export function preferredDaysOffFor(rules: RuleLike[], employeeId: string, weekStart: string): Set<number> {
+  const weekEnd = addDays(weekStart, 5);
+  const applies = (rule: RuleLike) =>
+    rule.rule_type === "preferred_day_off" &&
+    (!rule.start_date || rule.start_date <= weekEnd) &&
+    (!rule.end_date || rule.end_date >= weekStart);
+  const toDays = (list: RuleLike[]) => {
+    const result = new Set<number>();
+    for (const rule of list) {
+      for (const part of rule.rule_value.split(/[,|/]|\band\b/)) {
+        const text = part.trim().toLowerCase().replace(/\.$/, "");
+        if (text.length < 3) continue;
+        const index = WEEKDAY_NAMES.findIndex((name) => name.toLowerCase().startsWith(text));
+        if (index >= 0) result.add(index);
+      }
+    }
+    return result;
+  };
+  const own = toDays(rules.filter((rule) => applies(rule) && rule.employee_id === employeeId));
+  return own.size > 0 ? own : toDays(rules.filter((rule) => applies(rule) && !rule.employee_id));
+}
+
 /** Order categories are shown in. */
 export const CHECK_CATEGORIES = ["Not started", "Coverage", "Position rules", "Rules", "Days off", "Saturdays off", "Hours", "Short rest", "Preferences", "Fairness", "Monthly amounts"];
 
@@ -274,6 +301,29 @@ export function checkSchedule(input: CheckInput): CheckIssue[] {
         add({ severity: "heads-up", category: "Hours", key: `Hours:over:${employee.id}:w${weekIndex}`, scopeDays: weekDays.map((day) => day.offset), employeeId: employee.id, message: `${employee.employee_name} has ${hours.toFixed(2)} hours ${weekLabel(weekIndex)} (target ${rules.targetHours}).` });
       } else if (hours < rules.targetHours - 4) {
         add({ severity: "heads-up", category: "Hours", key: `Hours:under:${employee.id}:w${weekIndex}`, scopeDays: weekDays.map((day) => day.offset), employeeId: employee.id, message: `${employee.employee_name} has ${hours.toFixed(2)} hours ${weekLabel(weekIndex)} (target ${rules.targetHours}).` });
+      }
+
+      // Preferred days off: a weekday off that isn't a preferred day, in a week
+      // where they work one of their preferred days (so it could have been there).
+      const preferredOff = preferredDaysOffFor(savedRules, employee.id, weekStarts[weekIndex]);
+      if (preferredOff.size > 0) {
+        const workingPreferred = weekDays.some(
+          (day) => preferredOff.has(day.weekday) && !input.holidayFor(day.offset) && input.isWorking(codeAt(employee.id, day.offset)),
+        );
+        for (const day of weekDays) {
+          if (!workingPreferred) break;
+          if (day.weekday >= 5 || preferredOff.has(day.weekday) || input.holidayFor(day.offset)) continue;
+          if (codeAt(employee.id, day.offset) !== "OFF") continue;
+          add({
+            severity: "heads-up",
+            category: "Preferences",
+            key: `Preferences:dayoff:${employee.id}:${day.offset}`,
+            scopeDays: [day.offset],
+            employeeId: employee.id,
+            offset: day.offset,
+            message: `${employee.employee_name} is off ${dayLabel(day)}; preferred days off are ${[...preferredOff].sort().map((weekday) => WEEKDAY_NAMES[weekday]?.slice(0, 3)).join(", ")}.`,
+          });
+        }
       }
 
       // Closing preferences for this week.

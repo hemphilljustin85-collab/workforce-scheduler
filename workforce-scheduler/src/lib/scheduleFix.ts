@@ -6,6 +6,7 @@
 //   - swap:     two people swap shifts on a day (also "give a shift to someone who's off")
 //   - relocate: someone takes a shift on this day and gets a day off elsewhere that week
 //   - trade:    two people trade shifts on two days of the same week
+//   - move off: someone works this day and takes another day off (preferences)
 //   - day off:  someone gets this day off and works a day they had off that
 //               week instead (optionally another person takes over their role)
 // An edit is only used if the issue is gone and it adds no new problem, so a
@@ -112,6 +113,24 @@ export function findFix(
       }
     }
 
+    // move day off: this person works today instead and takes another day of
+    // the week off (e.g. a Monday off moves to a preferred Tuesday off).
+    if (issue.employeeId && issue.category === "Preferences" && codeAt(issue.employeeId, offset) === "OFF" && canChange(issue.employeeId, offset)) {
+      const a = issue.employeeId;
+      for (const other of weekDays) {
+        const otherCode = codeAt(a, other.offset);
+        if (otherCode === "OFF" || !canChange(a, other.offset) || !context.codesForDay(other.offset).includes("OFF")) continue;
+        const todayCodes = allowedOn(offset, otherCode) ? [otherCode, ...codes.filter((code) => code !== otherCode)] : codes;
+        for (const code of todayCodes) {
+          if (code === "OFF") continue;
+          push([
+            { employeeId: a, offset, to: code },
+            { employeeId: a, offset: other.offset, to: "OFF" },
+          ]);
+        }
+      }
+    }
+
     // day off: give this person the day off, have them work a day they had off
     // this week, and optionally have someone already working take their role
     // (e.g. an opener becomes the closer) so coverage holds.
@@ -182,6 +201,8 @@ export function findFix(
     if (problems.some((item) => !beforeProblemKeys.has(item.key))) continue;
 
     const newHeadsUps = after.filter((item) => item.severity === "heads-up" && !beforeKeys.has(item.key));
+    // Swapping one heads-up for another isn't a fix.
+    if (issue.severity === "heads-up" && newHeadsUps.length > 0) continue;
     const headsUps = after.length - problems.length;
     const score = [problems.length, newHeadsUps.length, headsUps, edit.length];
 

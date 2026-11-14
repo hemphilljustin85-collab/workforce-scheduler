@@ -950,6 +950,7 @@ export default function SchedulePage() {
       const employeeUnavailableDays = new Map<string, Set<number>>();
       const employeePreferredDaysOff = new Map<string, Set<number>>();
       const employeeRequiredShifts = new Map<string, Map<number, ShiftCode>>();
+      const employeePreferredShift = new Map<string, ShiftCode>();
 
       // Preferred days off: a store-wide rule (no employee) applies to everyone
       // who has none of their own. Several rules / "Tuesday, Wednesday" add up.
@@ -965,7 +966,23 @@ export default function SchedulePage() {
         if (!rule.employee_id) continue;
         if (rule.rule_type === "unavailable") {
           const values = rule.rule_value.split(",").map(normalizeDayName).filter((day): day is number => day !== null);
-          employeeUnavailableDays.set(rule.employee_id, new Set(values));
+          const existing = employeeUnavailableDays.get(rule.employee_id) ?? new Set<number>();
+          values.forEach((day) => existing.add(day));
+          employeeUnavailableDays.set(rule.employee_id, existing);
+        }
+        if (rule.rule_type === "availability") {
+          // "Only works these days": every other day is unavailable.
+          const works = new Set(rule.rule_value.split(",").map(normalizeDayName).filter((day): day is number => day !== null));
+          if (works.size > 0) {
+            const existing = employeeUnavailableDays.get(rule.employee_id) ?? new Set<number>();
+            WORK_DAYS.forEach((_, day) => {
+              if (!works.has(day)) existing.add(day);
+            });
+            employeeUnavailableDays.set(rule.employee_id, existing);
+          }
+        }
+        if (rule.rule_type === "preferred_shift" && isShiftCode(rule.rule_value.trim(), shiftOptions)) {
+          employeePreferredShift.set(rule.employee_id, rule.rule_value.trim());
         }
         if (rule.rule_type === "preferred_day_off") {
           const values = rule.rule_value.split(/[,|/]|\band\b/).map(normalizeDayName).filter((day): day is number => day !== null);
@@ -1254,11 +1271,22 @@ export default function SchedulePage() {
             }),
           );
 
+        // "Prefers a shift": 0 = prefers this role, 1 = no preference, 2 = prefers the other role.
+        const prefersRole = (employee: Employee, role: "open" | "close") => {
+          const preferred = employeePreferredShift.get(employee.id);
+          if (!preferred) return 1;
+          const opens = isOpener(preferred);
+          const closesShift = isCloser(preferred);
+          if (role === "open") return opens ? 0 : closesShift ? 2 : 1;
+          return closesShift ? 0 : opens ? 2 : 1;
+        };
+
         const wd = dayIndex;
         const openersToday = [...rotated]
           .sort(
             (a, b) =>
               scarceForClosing(a) - scarceForClosing(b) ||
+              prefersRole(a, "open") - prefersRole(b, "open") ||
               targetPriority("open", a, day) - targetPriority("open", b, day) ||
               Number(targetPriority("close", a, day) === 0) - Number(targetPriority("close", b, day) === 0) ||
               keepForClosing(a) - keepForClosing(b) ||
@@ -1282,6 +1310,7 @@ export default function SchedulePage() {
           .sort(
             (a, b) =>
               targetPriority("close", a, day) - targetPriority("close", b, day) ||
+              prefersRole(a, "close") - prefersRole(b, "close") ||
               preferenceScore(a) - preferenceScore(b) ||
               closesOn[a.id][wd] - closesOn[b.id][wd] ||
               closes[a.id] - closes[b.id],

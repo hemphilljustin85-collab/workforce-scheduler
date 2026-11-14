@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import PositionStaffing from "../../src/components/PositionStaffing";
 import { supabase } from "../../src/lib/supabase";
 import RecoveryPhone from "../../src/components/RecoveryPhone";
 import { PHONE_RECOVERY_ENABLED } from "../../src/lib/phone";
@@ -225,6 +226,8 @@ export default function SettingsPage() {
               className="w-full rounded-lg border border-slate-300 px-3 py-2"
             />
           </label>
+
+          <PositionStaffing openersPerDay={form.openers_per_day} closersPerDay={form.closers_per_day} />
 
           <label className="space-y-2">
             <span className="font-medium">Target weekly hours</span>

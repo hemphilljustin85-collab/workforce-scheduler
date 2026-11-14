@@ -23,7 +23,52 @@ export type ParsedReport = {
   /** Which heading was used for each field, e.g. { name: "Worker", employeeId: "Employee ID" }. */
   columns: Partial<Record<WorkdayField, string>>;
   skipped: number;
+  /** Every heading in the heading row, for choosing the job-title column. */
+  headers: string[];
+  /** Column used for job titles, or null when none was found. */
+  titleColumn: number | null;
 };
+
+/**
+ * Which column holds the job title. Workday reports often have several
+ * (Business Title, Job Profile, Position, Position ID…); the plain-language
+ * title is best. ID, level, family and type columns are never used.
+ */
+export function rankTitleColumns(headers: string[]): number[] {
+  const scoreOf = (heading: string) => {
+    const text = normalize(heading);
+    if (!text || /\b(id|ids|number|no|#|code|date|family|level|type|category|grade|status|time|count|reference|ref)\b/.test(text)) return 0;
+    if (/business title/.test(text)) return 7;
+    if (/job title/.test(text)) return 6;
+    if (/position title/.test(text)) return 5;
+    if (/job profile/.test(text)) return 4;
+    if (/^title$|\btitle\b/.test(text)) return 3;
+    if (/\bposition\b/.test(text)) return 2;
+    if (/^job$|\bjob\b/.test(text)) return 1;
+    return 0;
+  };
+  return headers
+    .map((heading, index) => ({ index, score: scoreOf(heading) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map((item) => item.index);
+}
+
+/**
+ * Plain job title from a Workday value: drops position/job IDs
+ * ("P-012345 Retail Sales Consultant", "JP1043 - Store Manager"), the worker's
+ * name ("… (Glenn Henley)", "… - Glenn Henley") and a trailing "(Vacant)".
+ */
+export function cleanTitle(value: string, workerName: string): string {
+  let text = value.trim().replace(/\s+/g, " ");
+  text = text.replace(/^[A-Za-z]{0,4}[-_ ]?\d{3,}[A-Za-z]?\s*[-:–—]?\s*/, "");
+  const nameParts = workerName.toLowerCase().split(" ").filter((part) => part.length >= 2);
+  const mentionsName = (part: string) => nameParts.some((name) => part.toLowerCase().includes(name));
+  text = text.replace(/\s*\(([^)]*)\)\s*$/, (whole, inner: string) => (mentionsName(inner) || /\d|vacant|filled/i.test(inner) ? "" : whole));
+  const dash = text.match(/^(.*\S)\s+[-–—]\s+(.+)$/);
+  if (dash && mentionsName(dash[2])) text = dash[1];
+  return text.trim();
+}
 
 const HEADINGS: Record<WorkdayField, string[]> = {
   name: ["worker", "name", "employee", "employee name", "worker name", "full name", "legal name", "preferred name", "associate", "team member"],
@@ -142,7 +187,7 @@ function splitWorker(value: string): { name: string; id: string | null } {
   return { name: name.replace(/\s+/g, " "), id };
 }
 
-export function parseWorkdayRows(rows: string[][]): ParsedReport {
+export function parseWorkdayRows(rows: string[][], options: { titleColumn?: number | null } = {}): ParsedReport {
   // The heading row is the first one (in the top 15) that has a name column.
   let headerIndex = -1;
   let fields: Array<WorkdayField | null> = [];
@@ -159,11 +204,20 @@ export function parseWorkdayRows(rows: string[][]): ParsedReport {
   const columnOf: Partial<Record<WorkdayField, number>> = {};
   const columns: Partial<Record<WorkdayField, string>> = {};
   fields.forEach((field, column) => {
+    if (field === "position") return; // chosen below
     if (field && columnOf[field] === undefined) {
       columnOf[field] = column;
       columns[field] = rows[headerIndex][column];
     }
   });
+  const headers = rows[headerIndex].map((heading) => String(heading ?? "").trim());
+  const ranked = rankTitleColumns(headers);
+  const titleColumn = options.titleColumn !== undefined ? options.titleColumn : ranked[0] ?? null;
+  const titleColumns = titleColumn === null || titleColumn < 0 ? [] : [titleColumn, ...ranked.filter((column) => column !== titleColumn)];
+  if (titleColumn !== null && titleColumn >= 0) {
+    columnOf.position = titleColumn;
+    columns.position = headers[titleColumn];
+  }
   const workers: WorkdayWorker[] = [];
   let skipped = 0;
   const at = (row: string[], field: WorkdayField) => (columnOf[field] === undefined ? "" : (row[columnOf[field]!] ?? "").trim());
@@ -182,7 +236,8 @@ export function parseWorkdayRows(rows: string[][]): ParsedReport {
       row: headerIndex + offset + 2,
       name,
       employeeId: at(row, "employeeId") || id,
-      position: at(row, "position") || null,
+      // Chosen title column; if it's blank for this person, the next-best title column.
+      position: (titleColumns.map((column) => cleanTitle(String(row[column] ?? ""), name)).find(Boolean)) || null,
       email: at(row, "email") || null,
       phone: phoneDigits.length >= 7 ? at(row, "phone") : null,
       status: inactive ? "Inactive" : "Active",
@@ -190,7 +245,7 @@ export function parseWorkdayRows(rows: string[][]): ParsedReport {
     });
   });
 
-  return { workers, columns, skipped };
+  return { workers, columns, skipped, headers, titleColumn: titleColumn !== null && titleColumn >= 0 ? titleColumn : null };
 }
 
 export type ExistingEmployee = {

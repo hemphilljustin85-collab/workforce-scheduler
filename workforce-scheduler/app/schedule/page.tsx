@@ -54,7 +54,7 @@ import { downloadWorkdayExport, type WorkdayShiftRow } from "../../src/lib/workd
 import { isNativeApp, publicSiteUrl } from "../../src/lib/native";
 import { hoursClassName, type ScheduleSheetData } from "../../src/lib/scheduleSheet";
 import { isManagerPosition, parsePositions, POSITIONS_RULE } from "../../src/lib/positions";
-import { appliesOn, repairSelection, requirementsFromRules } from "../../src/lib/positionRequirements";
+import { appliesOn, meets, repairSelection, requirementsFromRules } from "../../src/lib/positionRequirements";
 
 /** A schedule row that can be dragged by its handle (mouse, touch or keyboard). */
 function SortableRow({ id, children }: { id: string; children: (handle: ReactNode) => ReactNode }) {
@@ -1199,9 +1199,16 @@ export default function SchedulePage() {
           }
         }
 
-        const openerCount = Math.min(rules.openersPerDay, rotated.length);
+        // Position minimums ("at least 2 ASR II must open") can need more people
+        // in a role than the store-wide count; use whichever is larger.
+        const minimumsFor = (role: "open" | "close") =>
+          requirementsFromRules(savedRules)
+            .map((item) => item.requirement)
+            .filter((requirement) => requirement.kind === "minimum" && requirement.role === role && appliesOn(requirement, dayIndex))
+            .reduce((sum, requirement) => sum + (requirement.kind === "minimum" ? requirement.min : 0), 0);
+        const openerCount = Math.min(Math.max(rules.openersPerDay, minimumsFor("open")), rotated.length);
         const remainingAfterOpeners = Math.max(rotated.length - openerCount, 0);
-        const closerCount = Math.min(rules.closersPerDay, remainingAfterOpeners);
+        const closerCount = Math.min(Math.max(rules.closersPerDay, minimumsFor("close")), remainingAfterOpeners);
 
         // Openers and closers: people still under a monthly preferred amount
         // first, people who have reached it last; then whoever has opened or
@@ -1233,10 +1240,25 @@ export default function SchedulePage() {
         // Keep someone who wants back-to-back closes free to close again tonight.
         const keepForClosing = (employee: Employee) => Number(preferenceScore(employee) < 0);
 
+        // People whose position a closing minimum needs today ("at least 2 Team
+        // Leaders close"): don't use them up as openers when they're scarce.
+        const closeMinimums = requirementsFromRules(savedRules)
+          .map((item) => item.requirement)
+          .filter((requirement) => requirement.kind === "minimum" && requirement.role === "close" && appliesOn(requirement, dayIndex));
+        const scarceForClosing = (employee: Employee) =>
+          Number(
+            closeMinimums.some((requirement) => {
+              if (requirement.kind !== "minimum") return false;
+              const inPosition = (person: Employee) => requirement.positions.some((name) => name.trim().toLowerCase() === (person.position || "").trim().toLowerCase());
+              return inPosition(employee) && rotated.filter(inPosition).length <= requirement.min;
+            }),
+          );
+
         const wd = dayIndex;
         const openersToday = [...rotated]
           .sort(
             (a, b) =>
+              scarceForClosing(a) - scarceForClosing(b) ||
               targetPriority("open", a, day) - targetPriority("open", b, day) ||
               Number(targetPriority("close", a, day) === 0) - Number(targetPriority("close", b, day) === 0) ||
               keepForClosing(a) - keepForClosing(b) ||
@@ -1254,6 +1276,7 @@ export default function SchedulePage() {
           openersToday.splice(0, openersToday.length, ...repaired);
         }
 
+        const openersBeforeCloseRepair = [...openersToday];
         const closersToday = rotated
           .filter((employee) => !openersToday.includes(employee))
           .sort(
@@ -1265,12 +1288,29 @@ export default function SchedulePage() {
           )
           .slice(0, closerCount);
         if (closeRequirements.length > 0) {
+          // Try people not opening first, then openers (an opener moved to
+          // closing trades places with the closer they replace).
           const repaired = repairSelection(
             closersToday,
-            rotated.filter((employee) => !openersToday.includes(employee) && !closersToday.includes(employee)),
+            [
+              ...rotated.filter((employee) => !openersToday.includes(employee) && !closersToday.includes(employee)),
+              ...openersToday,
+            ],
             closeRequirements,
           );
-          closersToday.splice(0, closersToday.length, ...repaired);
+          const displaced = closersToday.filter((employee) => !repaired.includes(employee));
+          openersToday.forEach((employee, index) => {
+            if (repaired.includes(employee)) {
+              const replacement = displaced.shift();
+              if (replacement) openersToday[index] = replacement;
+            }
+          });
+          // Swapping an opener out must not break the opening requirements.
+          if (openRequirements.length === 0 || openRequirements.every((requirement) => meets(requirement, openersToday.map((employee) => employee.position)))) {
+            closersToday.splice(0, closersToday.length, ...repaired);
+          } else {
+            openersToday.splice(0, openersToday.length, ...openersBeforeCloseRepair);
+          }
         }
 
         rotated.forEach((employee) => {

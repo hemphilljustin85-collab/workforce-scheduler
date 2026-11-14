@@ -129,7 +129,17 @@ export function repairSelection<T extends { id: string; position: string | null 
   requirements: PositionRequirement[],
 ): T[] {
   if (requirements.length === 0 || selected.length === 0) return selected;
-  const unmet = (people: T[]) => requirements.filter((requirement) => !meets(requirement, people.map((person) => person.position))).length;
+  // How far from meeting the requirements: a minimum counts each missing person,
+  // so "at least 2" improves one swap at a time.
+  const unmet = (people: T[]) =>
+    requirements.reduce((total, requirement) => {
+      const positions = people.map((person) => person.position);
+      if (requirement.kind === "minimum") {
+        const count = positions.filter((position) => requirement.positions.some((name) => same(position, name))).length;
+        return total + Math.max(0, requirement.min - count);
+      }
+      return total + (meets(requirement, positions) ? 0 : 1);
+    }, 0);
 
   let current = [...selected];
   let available = pool.filter((person) => !current.some((chosen) => chosen.id === person.id));

@@ -1,552 +1,508 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { supabase } from "../../src/lib/supabase";
-import { parseAvoidDays, parseClosingPattern } from "../../src/lib/closingPrefs";
+import { BUILT_IN_SHIFTS, customShiftToDefinition, type CustomShiftRow, type ShiftDefinition } from "../../src/lib/shifts";
+import {
+  DAY_NAMES,
+  DAY_SHORT,
+  EMPTY_DRAFT,
+  RULE_DEFINITIONS,
+  RULE_GROUPS,
+  buildRuleValue,
+  definitionFor,
+  parseRuleValue,
+  type RuleDefinition,
+  type RuleDraft,
+} from "../../src/lib/ruleCatalog";
 
 type Rule = {
   id: string;
-  store_id: string | null;
+  /** Several saved rows shown as one (e.g. "Tuesday", "Wednesday" preferred days off). */
+  mergedIds?: string[];
   employee_id: string | null;
   rule_type: string;
   rule_value: string;
   start_date: string | null;
   end_date: string | null;
-  created_at: string | null;
 };
 
-type Employee = {
-  id: string;
-  employee_name: string;
-  employee_id: string | null;
-  position: string | null;
-  status: string | null;
+type Employee = { id: string; employee_name: string; position: string | null };
+
+/** Rule types with their own pages (not shown in this list). */
+const HIDDEN_TYPES = ["starter_shifts", "holiday", "employee_order", "positions", "position_requirement", "workday_title_map"];
+const EVERYONE = "";
+
+type Editing = {
+  id: string | null;
+  mergedIds?: string[];
+  type: string | null;
+  employeeId: string;
+  draft: RuleDraft;
+  startDate: string;
+  endDate: string;
+  showDates: boolean;
 };
 
-type RuleForm = {
-  employee_id: string;
-  rule_type: string;
-  rule_value: string;
-  start_date: string;
-  end_date: string;
-};
-
-const emptyForm: RuleForm = {
-  employee_id: "",
-  rule_type: "openers_per_day",
-  rule_value: "2",
-  start_date: "",
-  end_date: "",
-};
-
-const RULE_TYPES = [
-  { value: "openers_per_day", label: "Openers per day" },
-  { value: "closers_per_day", label: "Closers per day" },
-  { value: "target_hours", label: "Target weekly hours" },
-  { value: "days_off_per_week", label: "Days off per week" },
-  { value: "saturday_off_goal", label: "Saturday-off goal" },
-  { value: "manager_saturday_goal", label: "Manager Saturday goal" },
-  { value: "availability", label: "Employee availability" },
-  { value: "unavailable", label: "Employee unavailable" },
-  { value: "preferred_shift", label: "Preferred shift" },
-  { value: "required_shift", label: "Required employee shift" },
-  { value: "allowed_days_for_shift", label: "Allowed days for shift" },
-  { value: "blocked_days_for_shift", label: "Blocked days for shift" },
-  { value: "preferred_day_off", label: "Preferred employee day off" },
-  { value: "monthly_close_target", label: "Closes per month on a day" },
-  { value: "monthly_open_target", label: "Opens per month on a day" },
-  { value: "avoid_closing_days", label: "Prefers not to close on" },
-  { value: "closing_pattern", label: "Closing shifts: back-to-back or spread out" },
-  { value: "custom", label: "Custom rule" },
-];
-
-function formatRuleType(value: string) {
-  return (
-    RULE_TYPES.find((rule) => rule.value === value)?.label ??
-    value.replaceAll("_", " ")
-  );
-}
-
-function getRulePlaceholder(ruleType: string) {
-  switch (ruleType) {
-    case "allowed_days_for_shift": return "Example: AM|Monday";
-    case "blocked_days_for_shift": return "Example: AM|Saturday";
-    case "required_shift": return "Example: Monday|CLOSE";
-    case "preferred_day_off": return "Example: Tuesday, Wednesday, Thursday";
-    case "availability": return "Example: Monday,Tuesday,Wednesday";
-    case "unavailable": return "Example: Friday,Saturday";
-    case "preferred_shift": return "Example: AM";
-    case "monthly_close_target": return "Example: Saturday|2";
-    case "monthly_open_target": return "Example: Monday|2";
-    case "avoid_closing_days": return "Example: Thursday";
-    case "closing_pattern": return "Together or Apart";
-    default: return "Example: 2, 40, or Monday";
-  }
-}
-
-function getRuleHelp(ruleType: string) {
-  switch (ruleType) {
-    case "allowed_days_for_shift": return "Format: SHIFT|DAY or SHIFT|DAY,DAY, using a short code from the Shifts page. Example: AM|Monday means the AM shift may only be assigned on Monday.";
-    case "blocked_days_for_shift": return "Format: SHIFT|DAY or SHIFT|DAY,DAY. The generator will avoid that shift on those days.";
-    case "required_shift": return "Choose an employee, then use DAY|SHIFT with a short code from the Shifts page. Example: Monday|CLOSE.";
-    case "preferred_day_off": return "One or more days, e.g. Tuesday, Wednesday, Thursday. Each week the day off goes on one of them, spread out so every day stays covered. Leave the employee blank to apply it to everyone.";
-    case "monthly_close_target": return "Format: DAY|NUMBER. Example: Saturday|2 means this person should close about 2 Saturdays each month (0 means avoid closing that day). Choose All employees to set it for everyone; a rule for one person overrides it. Auto Generate also counts closes already saved earlier in the month and in the previous month so it stays even.";
-    case "avoid_closing_days": return "Choose an employee and enter one or more days, e.g. Thursday or Thursday,Friday. Auto Generate avoids giving them closing shifts on these days when it can, and the schedule check shows a heads-up when they close on one.";
-    case "closing_pattern": return "Choose an employee and enter Together (they prefer closing shifts back-to-back, like Thu–Fri–Sat) or Apart (they prefer closes spread out, never two nights in a row). Auto Generate follows this when it can, and the schedule check shows a heads-up when it isn't met.";
-    case "monthly_open_target": return "Format: DAY|NUMBER. Example: Monday|2 means this person should open about 2 Mondays each month (0 means avoid opening that day). Choose All employees to set it for everyone; a rule for one person overrides it.";
-    case "availability": return "Choose an employee and list allowed days separated by commas.";
-    case "unavailable": return "Choose an employee and list blocked days separated by commas.";
-    default: return "Choose All employees for a store-wide rule. Date fields are optional.";
-  }
-}
+const shortDate = (value: string) => new Date(`${value}T12:00:00`).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 
 export default function RulesPage() {
   const [rules, setRules] = useState<Rule[]>([]);
   const [employees, setEmployees] = useState<Employee[]>([]);
+  const [shifts, setShifts] = useState<ShiftDefinition[]>(BUILT_IN_SHIFTS);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [showForm, setShowForm] = useState(false);
-  const [editingRule, setEditingRule] = useState<Rule | null>(null);
-  const [form, setForm] = useState<RuleForm>(emptyForm);
+  const [editing, setEditing] = useState<Editing | null>(null);
+  const [filter, setFilter] = useState<string>("all");
+  const [search, setSearch] = useState("");
   const [message, setMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
-  const formRef = useRef<HTMLFormElement>(null);
-
-  // Bring the form into view when it opens (the Edit buttons can be far down the list).
-  useEffect(() => {
-    if (showForm) formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [showForm, editingRule]);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    void Promise.all([loadRules(), loadEmployees()]);
+    void (async () => {
+      setLoading(true);
+      const [ruleResult, employeeResult, shiftResult] = await Promise.all([
+        supabase.from("ai_rules").select("id, employee_id, rule_type, rule_value, start_date, end_date").order("created_at"),
+        supabase.from("employees").select("id, employee_name, position").or("status.eq.Active,status.is.null").order("employee_name"),
+        supabase.from("shift_templates").select("code, name, start_time, end_time, paid_hours, color").eq("active", true),
+      ]);
+      if (ruleResult.error) setErrorMessage(ruleResult.error.message);
+      setRules(((ruleResult.data as Rule[]) || []).filter((rule) => !HIDDEN_TYPES.includes(rule.rule_type)));
+      setEmployees((employeeResult.data as Employee[]) || []);
+      if (!shiftResult.error) setShifts([...BUILT_IN_SHIFTS, ...((shiftResult.data || []) as CustomShiftRow[]).map(customShiftToDefinition)]);
+      setLoading(false);
+    })();
   }, []);
 
-  async function loadRules() {
-    setLoading(true);
-    setErrorMessage("");
+  useEffect(() => {
+    if (editing) panelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [editing?.id, editing?.type, editing]);
 
-    const { data, error } = await supabase
-      .from("ai_rules")
-      .select(
-        "id, store_id, employee_id, rule_type, rule_value, start_date, end_date, created_at",
-      )
-      .order("rule_type");
+  const nameOf = (employeeId: string | null) =>
+    employeeId ? employees.find((employee) => employee.id === employeeId)?.employee_name ?? "Former employee" : "Everyone";
+  const shiftLabel = (code: string) => shifts.find((shift) => shift.code === code)?.label ?? (code || "a shift");
 
-    if (error) {
-      console.error(error);
-      setErrorMessage(error.message);
-    } else {
-      // The starter-shift toggle and holidays have their own pages, not this list.
-      setRules(((data as Rule[]) || []).filter((rule) => !["starter_shifts", "holiday", "employee_order", "positions", "position_requirement", "workday_title_map"].includes(rule.rule_type)));
-    }
-
-    setLoading(false);
+  function sentenceFor(rule: Rule) {
+    const definition = definitionFor(rule.rule_type);
+    if (!definition) return `${rule.rule_type.replaceAll("_", " ")}: ${rule.rule_value}`;
+    return definition.sentence(parseRuleValue(rule.rule_type, rule.rule_value), nameOf(rule.employee_id), shiftLabel);
   }
 
-
-  async function loadEmployees() {
-    const { data, error } = await supabase
-      .from("employees")
-      .select("id, employee_name, employee_id, position, status")
-      .or("status.eq.Active,status.is.null")
-      .order("employee_name");
-
-    if (error) {
-      console.error(error);
-      setErrorMessage((current) =>
-        current ? `${current} | ${error.message}` : error.message,
-      );
-      return;
-    }
-
-    setEmployees((data as Employee[]) || []);
-  }
-
-  function openAddForm() {
-    setEditingRule(null);
-    setForm(emptyForm);
-    setMessage("");
-    setErrorMessage("");
-    setShowForm(true);
-  }
-
-  function openEditForm(rule: Rule) {
-    setEditingRule(rule);
-    setForm({
-      employee_id: rule.employee_id || "",
-      rule_type: rule.rule_type,
-      rule_value: rule.rule_value,
-      start_date: rule.start_date || "",
-      end_date: rule.end_date || "",
+  // Group the list: Everyone first, then each person.
+  const sections = useMemo(() => {
+    const query = search.trim().toLowerCase();
+    const visible = rules.filter((rule) => {
+      if (filter === "everyone" && rule.employee_id) return false;
+      if (filter !== "all" && filter !== "everyone" && rule.employee_id !== filter) return false;
+      if (!query) return true;
+      const definition = definitionFor(rule.rule_type);
+      return [sentenceFor(rule), definition?.title ?? "", nameOf(rule.employee_id)].join(" ").toLowerCase().includes(query);
     });
+    // Show several "preferred days off" rows for the same person as one rule.
+    const merged: Rule[] = [];
+    for (const rule of visible) {
+      const twin = rule.rule_type === "preferred_day_off" && !rule.start_date && !rule.end_date
+        ? merged.find((other) => other.rule_type === "preferred_day_off" && other.employee_id === rule.employee_id && !other.start_date && !other.end_date)
+        : undefined;
+      if (twin) {
+        const days = parseRuleValue("preferred_day_off", `${twin.rule_value}, ${rule.rule_value}`).days;
+        twin.rule_value = buildRuleValue("preferred_day_off", { ...EMPTY_DRAFT, days }).value ?? twin.rule_value;
+        twin.mergedIds = [...(twin.mergedIds ?? [twin.id]), rule.id];
+      } else merged.push({ ...rule });
+    }
+    const groups = new Map<string, Rule[]>();
+    for (const rule of merged) {
+      const key = rule.employee_id ?? EVERYONE;
+      groups.set(key, [...(groups.get(key) ?? []), rule]);
+    }
+    return [...groups.entries()]
+      .sort(([a], [b]) => (a === EVERYONE ? -1 : b === EVERYONE ? 1 : nameOf(a).localeCompare(nameOf(b))))
+      .map(([key, list]) => ({
+        key,
+        title: key === EVERYONE ? "Everyone (store-wide)" : nameOf(key),
+        rules: list.sort((a, b) => RULE_DEFINITIONS.findIndex((d) => d.type === a.rule_type) - RULE_DEFINITIONS.findIndex((d) => d.type === b.rule_type)),
+      }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rules, employees, shifts, filter, search]);
+
+  function startAdd(employeeId = filter !== "all" && filter !== "everyone" ? filter : EVERYONE) {
     setMessage("");
     setErrorMessage("");
-    setShowForm(true);
+    setEditing({ id: null, type: null, employeeId, draft: EMPTY_DRAFT, startDate: "", endDate: "", showDates: false });
   }
 
-  function closeForm() {
-    if (saving) return;
-    setShowForm(false);
-    setEditingRule(null);
-    setForm(emptyForm);
+  function startEdit(rule: Rule) {
+    setMessage("");
+    setErrorMessage("");
+    setEditing({
+      id: rule.id,
+      mergedIds: rule.mergedIds,
+      type: rule.rule_type,
+      employeeId: rule.employee_id ?? EVERYONE,
+      draft: parseRuleValue(rule.rule_type, rule.rule_value),
+      startDate: rule.start_date ?? "",
+      endDate: rule.end_date ?? "",
+      showDates: Boolean(rule.start_date || rule.end_date),
+    });
   }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  function chooseType(definition: RuleDefinition) {
+    if (!editing) return;
+    const employeeId =
+      definition.scope === "store" ? EVERYONE : definition.scope === "person" && !editing.employeeId ? employees[0]?.id ?? "" : editing.employeeId;
+    const firstShift = shifts[0]?.code ?? "";
+    setEditing({ ...editing, type: definition.type, employeeId, draft: { ...EMPTY_DRAFT, shift: firstShift, ...(definition.defaults ?? {}) } });
+  }
 
-    if (!form.rule_type.trim() || !form.rule_value.trim()) {
-      setErrorMessage("Rule type and rule value are required.");
+  async function save() {
+    if (!editing?.type) return;
+    const definition = definitionFor(editing.type)!;
+    if (definition.scope === "person" && !editing.employeeId) {
+      setErrorMessage("Choose who this rule is for.");
       return;
     }
-
-    if (["avoid_closing_days", "closing_pattern"].includes(form.rule_type) && !form.employee_id) {
-      setErrorMessage("Choose the employee this closing preference is for.");
+    const built = buildRuleValue(editing.type, editing.draft);
+    if (built.error) {
+      setErrorMessage(built.error);
       return;
     }
-
-    if (form.rule_type === "avoid_closing_days") {
-      const listed = form.rule_value.split(",").filter((day) => day.trim()).length;
-      if (listed === 0 || parseAvoidDays(form.rule_value).length !== listed) {
-        setErrorMessage("Enter one or more days Monday–Saturday, separated by commas, e.g. Thursday,Friday.");
-        return;
-      }
-    }
-
-    if (form.rule_type === "closing_pattern" && !parseClosingPattern(form.rule_value)) {
-      setErrorMessage("Enter Together (closing shifts back-to-back) or Apart (spread out).");
+    if (editing.startDate && editing.endDate && editing.endDate < editing.startDate) {
+      setErrorMessage("The end date is before the start date.");
       return;
     }
-
-    if (["monthly_close_target", "monthly_open_target"].includes(form.rule_type)) {
-      const [dayValue, countValue] = form.rule_value.split("|").map((part) => part.trim());
-      const validDay = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"].includes((dayValue || "").toLowerCase());
-      const count = Number(countValue);
-      if (!validDay || countValue === undefined || countValue === "" || !Number.isInteger(count) || count < 0 || count > 6) {
-        setErrorMessage("Use DAY|NUMBER, for example Saturday|2 (a day Monday–Saturday and a whole number from 0 to 6).");
-        return;
-      }
-    }
-
     setSaving(true);
-    setMessage("");
     setErrorMessage("");
-
     const payload = {
-      employee_id: form.employee_id.trim() || null,
-      rule_type: form.rule_type.trim(),
-      rule_value: form.rule_value.trim(),
-      start_date: form.start_date || null,
-      end_date: form.end_date || null,
+      employee_id: editing.employeeId || null,
+      rule_type: editing.type,
+      rule_value: built.value!,
+      start_date: editing.showDates ? editing.startDate || null : null,
+      end_date: editing.showDates ? editing.endDate || null : null,
     };
-
-    const result = editingRule
-      ? await supabase.from("ai_rules").update(payload).eq("id", editingRule.id).select("id")
-      : await supabase.from("ai_rules").insert(payload).select("id");
-
-    if (result.error) {
-      console.error(result.error);
-      setErrorMessage(result.error.message);
-      setSaving(false);
-      return;
-    }
-
-    // Supabase returns no error when access rules block a change; it just changes nothing.
-    if (!result.data || result.data.length === 0) {
-      setErrorMessage(
-        editingRule
-          ? "This rule couldn't be updated. Your account may not have permission to edit rules. Ask the workspace owner to check access."
-          : "This rule couldn't be added. Your account may not have permission to add rules. Ask the workspace owner to check access.",
-      );
-      setSaving(false);
-      return;
-    }
-
-    setMessage(editingRule ? "Rule updated." : "Rule added.");
-    setShowForm(false);
-    setEditingRule(null);
-    setForm(emptyForm);
+    const result = editing.id
+      ? await supabase.from("ai_rules").update(payload).eq("id", editing.id).select("id, employee_id, rule_type, rule_value, start_date, end_date")
+      : await supabase.from("ai_rules").insert(payload).select("id, employee_id, rule_type, rule_value, start_date, end_date");
     setSaving(false);
-    await loadRules();
-  }
-
-  function getEmployeeLabel(employeeUuid: string | null) {
-    if (!employeeUuid) return "Applies to all employees";
-
-    const employee = employees.find((item) => item.id === employeeUuid);
-
-    if (!employee) return `Employee: ${employeeUuid}`;
-
-    return employee.employee_id
-      ? `${employee.employee_name} — ${employee.employee_id}`
-      : employee.employee_name;
-  }
-
-  async function removeRule(rule: Rule) {
-    const confirmed = window.confirm(
-      `Remove the rule "${formatRuleType(rule.rule_type)}"?`,
+    const saved = (result.data as Rule[] | null)?.[0];
+    if (result.error || !saved) {
+      setErrorMessage(result.error?.message || "This rule couldn't be saved. Your account may not have permission to change rules. Ask the workspace owner to check access.");
+      return;
+    }
+    const extraIds = (editing.mergedIds ?? []).filter((id) => id !== editing.id);
+    if (extraIds.length > 0) await supabase.from("ai_rules").delete().in("id", extraIds);
+    setRules((current) =>
+      (editing.id ? current.map((rule) => (rule.id === editing.id ? saved : rule)) : [...current, saved]).filter((rule) => !extraIds.includes(rule.id)),
     );
+    setMessage(`${editing.id ? "Updated" : "Added"}: ${sentenceFor(saved)}`);
+    setEditing(null);
+  }
 
-    if (!confirmed) return;
-
+  async function remove(rule: Rule) {
+    if (!window.confirm(`Remove this rule?\n\n${sentenceFor(rule)}`)) return;
     setMessage("");
     setErrorMessage("");
-
-    const { data, error } = await supabase
-      .from("ai_rules")
-      .delete()
-      .eq("id", rule.id)
-      .select("id");
-
-    if (error) {
-      console.error(error);
-      setErrorMessage(error.message);
+    const ids = rule.mergedIds ?? [rule.id];
+    const { data, error } = await supabase.from("ai_rules").delete().in("id", ids).select("id");
+    if (error || !data?.length) {
+      setErrorMessage(error?.message || "This rule couldn't be removed. Your account may not have permission to remove rules.");
       return;
     }
-
-    if (!data || data.length === 0) {
-      setErrorMessage("This rule couldn't be removed. Your account may not have permission to remove rules. Ask the workspace owner to check access.");
-      return;
-    }
-
-    setMessage("Rule removed.");
-    await loadRules();
+    setRules((current) => current.filter((item) => !ids.includes(item.id)));
+    if (editing?.id === rule.id) setEditing(null);
+    setMessage(`Removed: ${sentenceFor(rule)}`);
   }
+
+  const definition = editing?.type ? definitionFor(editing.type) : undefined;
+  const preview = editing?.type && definition ? definition.sentence(editing.draft, nameOf(editing.employeeId || null), shiftLabel) : "";
+  const setDraft = (patch: Partial<RuleDraft>) => editing && setEditing({ ...editing, draft: { ...editing.draft, ...patch } });
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h1 className="text-4xl font-bold">Rules Management</h1>
+          <h1 className="text-4xl font-bold">Rules</h1>
           <p className="mt-1 text-slate-600">
-            Add store-wide and employee-specific scheduling rules.
+            How Auto Generate builds the schedule: for everyone, or for one person. The schedule check warns when a rule isn&apos;t met.
           </p>
         </div>
-
-        <button
-          type="button"
-          onClick={openAddForm}
-          className="rounded-lg bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700"
-        >
-          Add Rule
+        <button type="button" onClick={() => startAdd()} className="shrink-0 whitespace-nowrap rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white hover:bg-blue-700">
+          + Add rule
         </button>
       </div>
 
-      {message && (
-        <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-green-800">
-          {message}
-        </div>
+      {message && <div className="rounded-lg border border-green-200 bg-green-50 p-3 text-green-800">{message}</div>}
+      {errorMessage && !editing && (
+        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-red-800">{errorMessage}</div>
       )}
 
-      {errorMessage && (
-        <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-red-800">
-          <p className="font-semibold">Rules error</p>
-          <p className="mt-1 text-sm">{errorMessage}</p>
-          {errorMessage.toLowerCase().includes("row-level security") && (
-            <p className="mt-2 text-sm">
-              Your account doesn&apos;t have permission to change rules. Ask the
-              workspace owner to check your access on the Team page.
-            </p>
+      {/* Add / edit */}
+      {editing && (
+        <div ref={panelRef} className="scroll-mt-4 rounded-2xl bg-white p-5 shadow-lg ring-1 ring-blue-200 sm:p-6">
+          <div className="flex items-center justify-between gap-3">
+            <h2 className="text-2xl font-bold">{editing.id ? "Edit rule" : "Add a rule"}</h2>
+            <button type="button" onClick={() => setEditing(null)} disabled={saving} className="rounded-lg px-3 py-1 text-slate-600 hover:bg-slate-100">Cancel</button>
+          </div>
+
+          {/* Step 1: what kind */}
+          {!editing.type ? (
+            <div className="mt-5 space-y-5">
+              <p className="text-sm font-semibold text-slate-700">What kind of rule?</p>
+              {RULE_GROUPS.map((group) => (
+                <div key={group}>
+                  <h3 className="text-xs font-bold uppercase tracking-wide text-slate-500">{group}</h3>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                    {RULE_DEFINITIONS.filter((item) => item.group === group).map((item) => (
+                      <button
+                        key={item.type}
+                        type="button"
+                        onClick={() => chooseType(item)}
+                        className="flex items-start gap-3 rounded-xl border border-slate-200 p-3 text-left hover:border-blue-400 hover:bg-blue-50"
+                      >
+                        <span aria-hidden="true" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-lg text-blue-700">{item.icon}</span>
+                        <span>
+                          <span className="block font-semibold">{item.title}</span>
+                          <span className="block text-xs text-slate-500">{item.help}</span>
+                          <span className="mt-1 block text-[11px] font-medium text-slate-400">
+                            {item.scope === "store" ? "Store-wide" : item.scope === "person" ? "One person" : "Everyone or one person"}
+                          </span>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : definition && (
+            <div className="mt-5 space-y-5">
+              <div className="flex items-center gap-3">
+                <span aria-hidden="true" className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-600 text-lg text-white">{definition.icon}</span>
+                <div>
+                  <div className="font-bold">{definition.title}</div>
+                  <div className="text-sm text-slate-500">{definition.help}</div>
+                </div>
+                {!editing.id && (
+                  <button type="button" onClick={() => setEditing({ ...editing, type: null })} className="ml-auto text-sm font-semibold text-blue-700">Change</button>
+                )}
+              </div>
+
+              {/* Who */}
+              {definition.scope !== "store" && (
+                <Field label="Who is it for?">
+                  <select
+                    value={editing.employeeId}
+                    onChange={(e) => setEditing({ ...editing, employeeId: e.target.value })}
+                    className="w-full rounded-lg border border-slate-300 px-3 py-2 sm:w-72"
+                  >
+                    {definition.scope === "either" && <option value={EVERYONE}>Everyone</option>}
+                    {employees.map((employee) => <option key={employee.id} value={employee.id}>{employee.employee_name}</option>)}
+                  </select>
+                  {definition.scope === "either" && editing.employeeId === EVERYONE && (
+                    <p className="mt-1 text-xs text-slate-500">A rule for one person replaces this one for them.</p>
+                  )}
+                </Field>
+              )}
+
+              {/* Details */}
+              {definition.editor === "number" && (
+                <Field label={definition.title}>
+                  <Stepper value={editing.draft.number} min={definition.min ?? 0} max={definition.max ?? 99} step={definition.step ?? 1} unit={definition.unit} onChange={(number) => setDraft({ number })} />
+                </Field>
+              )}
+              {definition.editor === "days" && (
+                <Field label={definition.type === "preferred_day_off" ? "Which days? (they'll get one of these off each week)" : "Which days?"}>
+                  <DayPicker value={editing.draft.days} onChange={(days) => setDraft({ days })} />
+                </Field>
+              )}
+              {(definition.editor === "shift" || definition.editor === "dayShift" || definition.editor === "shiftDays") && (
+                <div className="flex flex-wrap gap-5">
+                  {definition.editor === "dayShift" && (
+                    <Field label="Day">
+                      <select value={editing.draft.day} onChange={(e) => setDraft({ day: Number(e.target.value) })} className="rounded-lg border border-slate-300 px-3 py-2">
+                        {DAY_NAMES.map((name, index) => <option key={name} value={index}>{name}</option>)}
+                      </select>
+                    </Field>
+                  )}
+                  <Field label="Shift">
+                    <select value={editing.draft.shift} onChange={(e) => setDraft({ shift: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2">
+                      {!shifts.some((shift) => shift.code === editing.draft.shift) && editing.draft.shift && <option value={editing.draft.shift}>{editing.draft.shift} (no longer offered)</option>}
+                      {shifts.map((shift) => <option key={shift.code} value={shift.code}>{shift.label}</option>)}
+                    </select>
+                  </Field>
+                </div>
+              )}
+              {definition.editor === "shiftDays" && (
+                <Field label={definition.type === "allowed_days_for_shift" ? "Only on these days" : "Never on these days"}>
+                  <DayPicker value={editing.draft.days} onChange={(days) => setDraft({ days })} />
+                </Field>
+              )}
+              {definition.editor === "dayCount" && (
+                <div className="flex flex-wrap items-end gap-5">
+                  <Field label="Day">
+                    <select value={editing.draft.day} onChange={(e) => setDraft({ day: Number(e.target.value) })} className="rounded-lg border border-slate-300 px-3 py-2">
+                      {DAY_NAMES.map((name, index) => <option key={name} value={index}>{name}s</option>)}
+                    </select>
+                  </Field>
+                  <Field label="Times a month (0 = avoid)">
+                    <Stepper value={editing.draft.number} min={0} max={6} step={1} unit="per month" onChange={(number) => setDraft({ number })} />
+                  </Field>
+                </div>
+              )}
+              {definition.editor === "pattern" && (
+                <Field label="Prefers">
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {([["Together", "Back-to-back", "e.g. Thu, Fri, Sat"], ["Apart", "Spread out", "never two nights in a row"]] as const).map(([value, title, text]) => (
+                      <button key={value} type="button" onClick={() => setDraft({ pattern: value })} className={`rounded-xl border p-3 text-left ${editing.draft.pattern === value ? "border-blue-600 bg-blue-50 ring-2 ring-blue-200" : "border-slate-200"}`}>
+                        <div className="font-semibold">{title}</div>
+                        <div className="text-xs text-slate-500">{text}</div>
+                      </button>
+                    ))}
+                  </div>
+                </Field>
+              )}
+              {definition.editor === "text" && (
+                <Field label="Note">
+                  <textarea value={editing.draft.text} onChange={(e) => setDraft({ text: e.target.value })} rows={3} className="w-full rounded-lg border border-slate-300 px-3 py-2" placeholder="e.g. Ask before scheduling Shundra on the first Saturday" />
+                </Field>
+              )}
+
+              {/* Dates */}
+              <div>
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={editing.showDates} onChange={(e) => setEditing({ ...editing, showDates: e.target.checked })} />
+                  Only for certain dates
+                </label>
+                {editing.showDates && (
+                  <div className="mt-2 flex flex-wrap gap-3">
+                    <Field label="From"><input type="date" value={editing.startDate} onChange={(e) => setEditing({ ...editing, startDate: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2" /></Field>
+                    <Field label="Until"><input type="date" value={editing.endDate} onChange={(e) => setEditing({ ...editing, endDate: e.target.value })} className="rounded-lg border border-slate-300 px-3 py-2" /></Field>
+                  </div>
+                )}
+              </div>
+
+              {/* Preview + save */}
+              <div className="rounded-xl bg-slate-900 p-4 text-white">
+                <div className="text-xs font-semibold uppercase tracking-wide text-blue-300">This rule says</div>
+                <div className="mt-1 text-lg font-semibold">{preview}</div>
+                {editing.showDates && (editing.startDate || editing.endDate) && (
+                  <div className="mt-1 text-sm text-slate-300">
+                    {editing.startDate ? `From ${shortDate(editing.startDate)}` : "Until"} {editing.endDate ? `${editing.startDate ? "until " : ""}${shortDate(editing.endDate)}` : "on"}
+                  </div>
+                )}
+              </div>
+              {errorMessage && <p className="rounded-lg bg-red-50 p-3 text-sm text-red-800">{errorMessage}</p>}
+              <div className="flex gap-2">
+                <button type="button" onClick={() => void save()} disabled={saving} className="rounded-lg bg-blue-600 px-5 py-2.5 font-semibold text-white disabled:opacity-50">
+                  {saving ? "Saving…" : editing.id ? "Save rule" : "Add rule"}
+                </button>
+                <button type="button" onClick={() => setEditing(null)} disabled={saving} className="rounded-lg border border-slate-300 px-4 py-2.5 font-medium">Cancel</button>
+              </div>
+            </div>
           )}
         </div>
       )}
 
-      {showForm && (
-        <form ref={formRef} onSubmit={handleSubmit} className="scroll-mt-4 rounded-xl bg-white p-6 shadow">
-          <div className="mb-5 flex items-center justify-between">
-            <h2 className="text-2xl font-bold">
-              {editingRule ? "Edit Rule" : "Add Rule"}
-            </h2>
-            <button
-              type="button"
-              onClick={closeForm}
-              className="rounded-md px-3 py-1 text-slate-600 hover:bg-slate-100"
-            >
-              Cancel
-            </button>
-          </div>
+      {/* Filters */}
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <select value={filter} onChange={(e) => setFilter(e.target.value)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 sm:w-60">
+          <option value="all">All rules</option>
+          <option value="everyone">Store-wide only</option>
+          {employees.map((employee) => <option key={employee.id} value={employee.id}>{employee.employee_name}</option>)}
+        </select>
+        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search rules…" className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-2" />
+      </div>
 
-          <div className="grid gap-4 md:grid-cols-2">
-            <label className="space-y-1">
-              <span className="text-sm font-medium">Rule type *</span>
-              <select
-                value={form.rule_type}
-                onChange={(event) => {
-                  const ruleType = event.target.value;
-                  setForm({
-                    ...form,
-                    rule_type: ruleType,
-                    rule_value:
-                      ruleType === "allowed_days_for_shift"
-                        ? "AM|Monday"
-                        : ruleType === "blocked_days_for_shift"
-                          ? "AM|Saturday"
-                          : ruleType === "required_shift"
-                            ? "Monday|CLOSE"
-                            : ruleType === "preferred_day_off"
-                              ? "Saturday"
-                              : ruleType === "monthly_close_target"
-                                ? "Saturday|2"
-                                : ruleType === "monthly_open_target"
-                                  ? "Monday|2"
-                                  : ruleType === "avoid_closing_days"
-                                    ? "Thursday"
-                                    : ruleType === "closing_pattern"
-                                      ? "Together"
-                                      : form.rule_value,
-                  });
-                }}
-                className="w-full rounded-lg border border-slate-300 px-3 py-2"
-              >
-                {RULE_TYPES.map((rule) => (
-                  <option key={rule.value} value={rule.value}>
-                    {rule.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-sm font-medium">Rule value *</span>
-              <input
-                required
-                value={form.rule_value}
-                onChange={(event) =>
-                  setForm({ ...form, rule_value: event.target.value })
-                }
-                className="w-full rounded-lg border border-slate-300 px-3 py-2"
-                placeholder={getRulePlaceholder(form.rule_type)}
-              />
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-sm font-medium">Employee</span>
-              <select
-                value={form.employee_id}
-                onChange={(event) =>
-                  setForm({ ...form, employee_id: event.target.value })
-                }
-                className="w-full rounded-lg border border-slate-300 px-3 py-2"
-              >
-                <option value="">All employees / store-wide rule</option>
-                {employees.map((employee) => (
-                  <option key={employee.id} value={employee.id}>
-                    {employee.employee_name}
-                    {employee.employee_id
-                      ? ` — ${employee.employee_id}`
-                      : ""}
-                    {employee.position ? ` (${employee.position})` : ""}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-sm font-medium">Start date</span>
-              <input
-                type="date"
-                value={form.start_date}
-                onChange={(event) =>
-                  setForm({ ...form, start_date: event.target.value })
-                }
-                className="w-full rounded-lg border border-slate-300 px-3 py-2"
-              />
-            </label>
-
-            <label className="space-y-1">
-              <span className="text-sm font-medium">End date</span>
-              <input
-                type="date"
-                value={form.end_date}
-                onChange={(event) =>
-                  setForm({ ...form, end_date: event.target.value })
-                }
-                className="w-full rounded-lg border border-slate-300 px-3 py-2"
-              />
-            </label>
-          </div>
-
-          <div className="mt-4 rounded-lg bg-slate-50 p-4 text-sm text-slate-600">
-            {getRuleHelp(form.rule_type)}
-          </div>
-
-          <div className="mt-6 flex justify-end gap-3">
-            <button
-              type="button"
-              onClick={closeForm}
-              className="rounded-lg border border-slate-300 px-4 py-2 hover:bg-slate-50"
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              disabled={saving}
-              className="rounded-lg bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700 disabled:opacity-60"
-            >
-              {saving
-                ? "Saving..."
-                : editingRule
-                  ? "Save Changes"
-                  : "Add Rule"}
-            </button>
-          </div>
-        </form>
-      )}
-
+      {/* List */}
       {loading ? (
-        <div className="rounded-xl bg-white p-6 shadow">Loading rules...</div>
-      ) : rules.length === 0 ? (
-        <div className="rounded-xl bg-white p-6 text-center shadow">
-          No scheduling rules have been added yet.
+        <div className="space-y-3">{[0, 1, 2].map((item) => <div key={item} className="h-20 animate-pulse rounded-xl bg-white shadow-sm" />)}</div>
+      ) : sections.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-slate-300 bg-white p-8 text-center">
+          <p className="text-slate-600">{rules.length === 0 ? "No rules yet." : "No rules match."}</p>
+          <button type="button" onClick={() => startAdd()} className="mt-3 rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white">+ Add rule</button>
         </div>
       ) : (
-        <div className="grid gap-4">
-          {rules.map((rule) => (
-            <div key={rule.id} className="rounded-xl bg-white p-6 shadow">
-              <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-                <div>
-                  <div className="text-sm font-semibold uppercase tracking-wide text-blue-600">
-                    {formatRuleType(rule.rule_type)}
-                  </div>
-
-                  <div className="mt-2 text-2xl font-bold text-slate-900">
-                    {rule.rule_value}
-                  </div>
-
-                  <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-600">
-                    <span className="rounded-full bg-slate-100 px-3 py-1">
-                      {getEmployeeLabel(rule.employee_id)}
-                    </span>
-
-                    {(rule.start_date || rule.end_date) && (
-                      <span className="rounded-full bg-slate-100 px-3 py-1">
-                        {rule.start_date || "Any time"} through{" "}
-                        {rule.end_date || "No end date"}
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => openEditForm(rule)}
-                    className="rounded-lg border border-slate-300 px-4 py-2 hover:bg-slate-50"
-                  >
-                    Edit
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void removeRule(rule)}
-                    className="rounded-lg bg-red-600 px-4 py-2 text-white hover:bg-red-700"
-                  >
-                    Remove
-                  </button>
-                </div>
-              </div>
+        sections.map((section) => (
+          <section key={section.key} className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h2 className="text-lg font-bold">{section.title}</h2>
+              <button type="button" onClick={() => startAdd(section.key)} className="text-sm font-semibold text-blue-700">+ Add for {section.key === EVERYONE ? "everyone" : section.title}</button>
             </div>
-          ))}
-        </div>
+            <ul className="divide-y">
+              {section.rules.map((rule) => {
+                const item = definitionFor(rule.rule_type);
+                return (
+                  <li key={rule.id} className="flex flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex min-w-0 items-start gap-3">
+                      <span aria-hidden="true" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-700">{item?.icon ?? "•"}</span>
+                      <div className="min-w-0">
+                        <div className="font-medium">{sentenceFor(rule)}</div>
+                        <div className="text-xs text-slate-500">
+                          {item?.title ?? rule.rule_type}
+                          {(rule.start_date || rule.end_date) && ` · ${rule.start_date ? shortDate(rule.start_date) : "…"} – ${rule.end_date ? shortDate(rule.end_date) : "…"}`}
+                          {rule.rule_type === "custom" && " · not used by Auto Generate"}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 gap-2 pl-11 sm:pl-0">
+                      <button type="button" onClick={() => startEdit(rule)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium hover:bg-slate-50">Edit</button>
+                      <button type="button" onClick={() => void remove(rule)} className="rounded-lg border border-red-200 px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50">Remove</button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        ))
       )}
+
+      <p className="text-sm text-slate-500">
+        Also see: <Link href="/positions" className="font-semibold text-blue-700">Positions</Link> (who can open/close with whom),{" "}
+        <Link href="/holidays" className="font-semibold text-blue-700">Holidays</Link>,{" "}
+        <Link href="/shifts" className="font-semibold text-blue-700">Shifts</Link> and{" "}
+        <Link href="/settings" className="font-semibold text-blue-700">Settings</Link>.
+      </p>
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="mb-1.5 text-sm font-semibold text-slate-700">{label}</div>
+      {children}
+    </div>
+  );
+}
+
+function DayPicker({ value, onChange }: { value: number[]; onChange: (days: number[]) => void }) {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {DAY_SHORT.map((label, index) => {
+        const on = value.includes(index);
+        return (
+          <button
+            key={label}
+            type="button"
+            onClick={() => onChange(on ? value.filter((day) => day !== index) : [...value, index].sort())}
+            className={`h-10 min-w-14 rounded-lg px-3 text-sm font-semibold ring-1 ${on ? "bg-blue-600 text-white ring-blue-600" : "bg-white text-slate-700 ring-slate-300 hover:bg-slate-50"}`}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function Stepper({ value, min, max, step, unit, onChange }: { value: number; min: number; max: number; step: number; unit?: string; onChange: (value: number) => void }) {
+  const clamp = (next: number) => Math.min(max, Math.max(min, Math.round(next / step) * step));
+  return (
+    <div className="flex items-center gap-2">
+      <button type="button" onClick={() => onChange(clamp(value - step))} className="h-10 w-10 rounded-lg border border-slate-300 text-lg font-bold hover:bg-slate-50" aria-label="Less">−</button>
+      <input type="number" value={value} min={min} max={max} step={step} onChange={(e) => onChange(Number(e.target.value))} className="h-10 w-20 rounded-lg border border-slate-300 text-center text-lg font-semibold" />
+      <button type="button" onClick={() => onChange(clamp(value + step))} className="h-10 w-10 rounded-lg border border-slate-300 text-lg font-bold hover:bg-slate-50" aria-label="More">+</button>
+      {unit && <span className="text-sm text-slate-500">{unit}</span>}
     </div>
   );
 }

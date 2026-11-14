@@ -64,6 +64,7 @@ export default function WorkdayImport({
   const [positionsRuleId, setPositionsRuleId] = useState<string | null>(null);
   const [savedTitleMap, setSavedTitleMap] = useState<{ id: string | null; map: Record<string, string> }>({ id: null, map: {} });
   const [titleMap, setTitleMap] = useState<Record<string, string>>({});
+  const [rawRows, setRawRows] = useState<string[][] | null>(null);
 
   useEffect(() => {
     void loadPositions().then((result) => {
@@ -90,6 +91,25 @@ export default function WorkdayImport({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
+  /** Suggested position for each Workday title (saved choice first, then a guess). */
+  function guessTitles(parsed: ParsedReport) {
+    const names = positions.map((position) => position.name);
+    const titles = [...new Set(parsed.workers.map((worker) => worker.position).filter((title): title is string => Boolean(title)))];
+    setTitleMap(Object.fromEntries(titles.map((title) => {
+      const saved = savedTitleMap.map[title];
+      const choice = saved && (saved === KEEP || names.includes(saved)) ? saved : guessPosition(title, names) ?? KEEP;
+      return [title, choice];
+    })));
+  }
+
+  /** Use a different column of the report for job titles. */
+  function chooseTitleColumn(column: number | null) {
+    if (!rawRows) return;
+    const parsed = parseWorkdayRows(rawRows, { titleColumn: column ?? -1 });
+    guessTitles(parsed);
+    setReport(parsed);
+  }
+
   async function chooseFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     event.target.value = "";
@@ -97,7 +117,9 @@ export default function WorkdayImport({
     setError("");
     setReading(true);
     try {
-      const parsed = parseWorkdayRows(await readReportFile(file));
+      const rows = await readReportFile(file);
+      const parsed = parseWorkdayRows(rows);
+      setRawRows(rows);
       if (parsed.workers.length === 0) throw new Error("The report has a heading row but no people under it.");
       const taken = new Set<string>();
       const initial = parsed.workers.map((worker) => {
@@ -108,13 +130,7 @@ export default function WorkdayImport({
         }
         return worker.status === "Active" ? "add" : "skip";
       });
-      const names = positions.map((position) => position.name);
-      const titles = [...new Set(parsed.workers.map((worker) => worker.position).filter((title): title is string => Boolean(title)))];
-      setTitleMap(Object.fromEntries(titles.map((title) => {
-        const saved = savedTitleMap.map[title];
-        const choice = saved && (saved === KEEP || names.includes(saved)) ? saved : guessPosition(title, names) ?? KEEP;
-        return [title, choice];
-      })));
+      guessTitles(parsed);
       setReport(parsed);
       setActions(initial);
       setFileName(file.name);
@@ -274,11 +290,27 @@ export default function WorkdayImport({
               </label>
             </div>
 
+            <div className="mt-4 rounded-xl border bg-slate-50 p-4">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h3 className="font-semibold">Workday job titles → positions</h3>
+                  <p className="mt-0.5 text-xs text-slate-500">Check each one. Your choices are remembered for the next import.</p>
+                </div>
+                <label className="flex items-center gap-2 text-sm">
+                  <span className="whitespace-nowrap text-slate-600">Job title column</span>
+                  <select
+                    value={report.titleColumn ?? -1}
+                    onChange={(e) => chooseTitleColumn(Number(e.target.value) < 0 ? null : Number(e.target.value))}
+                    className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm"
+                  >
+                    <option value={-1}>None (don&apos;t use titles)</option>
+                    {report.headers.map((heading, index) => heading && <option key={index} value={index}>{heading}</option>)}
+                  </select>
+                </label>
+              </div>
             {titles.length > 0 && (
-              <div className="mt-4 rounded-xl border bg-slate-50 p-4">
-                <h3 className="font-semibold">Workday job titles → positions</h3>
-                <p className="mt-0.5 text-xs text-slate-500">Check each one. Your choices are remembered for the next import.</p>
-                <div className="mt-3 space-y-2">
+              <div className="mt-3">
+                <div className="space-y-2">
                   {titles.map(([title, count]) => (
                     <div key={title} className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                       <span className="text-sm"><span className="font-medium">{title}</span> <span className="text-slate-500">· {count} {count === 1 ? "person" : "people"}</span></span>
@@ -296,6 +328,8 @@ export default function WorkdayImport({
                 </div>
               </div>
             )}
+            {titles.length === 0 && <p className="mt-3 text-sm text-slate-500">No job titles in this column.</p>}
+            </div>
 
             <div className="mt-4 divide-y rounded-xl border">
               {report.workers.map((worker, index) => {
